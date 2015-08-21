@@ -8,4 +8,6 @@ Adafruit DotStar LED strips
 (https://www.raspberrypi.org/) running Linux. May work with other LED strips and
 computers. 
 
+In the meantime, see https://github.com/adafruit/Adafruit_DotStar_Pi.
+
 
