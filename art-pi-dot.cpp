@@ -33,12 +33,9 @@
 #include <sys/ioctl.h>
 #include <pthread.h>
 #include <linux/spi/spidev.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 
-#define SPI_MOSI_PIN 10
-#define SPI_CLK_PIN  1
-
-#define ARTNET_BYTES_PER_UNIVERSE 510
-#define OUTPUT_BYTES_PER_UNIVERSE 510*4/3
 
 // Configuring the Art-Net universes. Art-Net has a hierarchical 
 // address space. The lowest level is the channel, representing for
@@ -54,7 +51,7 @@
  *
  * ** Assumptions **
  *
- * Updates are divided into frames, which contains values for
+ * Updates are divided into frames, which contain values for
  * all pixels. By necessity, if there is more than 170 pixels, the frame
  * spans multiple Art-Net universes, and thus multiple UDP
  * datagrams. The data in a frame is sent in a burst, so there is a much
@@ -65,7 +62,7 @@
  *
  * The packets aren't expected to arrive in order. This makes the 
  * algorithm more complex, but I have no reason to believe that all
- * software sends universes in any particular order).
+ * software sends universes in any particular order.
  *
  * Universe     |--------------- time  ------------------|
  * 1              d               d             d
@@ -141,17 +138,32 @@
  * ** Edge cases **
  *
  * When the frame rate gets close to the rate at which one can push 
- * frames over SPI, or the rate at which one can process packets, 
- * the sync. algorithm does less, and  
+ * frames over SPI, the behaviour is unpredictable. Have to make a 
+ * multithreaded version then.  
  *
  */
-const uint8_t universe_ids[] = {1, 2, 3};
-const uint8_t num_universes = sizeof(universe_ids) / sizeof(const uint8_t);
-const uint8_t universe_data[num_universes * ARTNET_BYTES_PER_UNIVERSE];
 
-const uint32_t bitrate = 32000000;
+#define ARTNET_PORT 0x1936
 
-uint8_t* output_buffers[2]; // double buffering
+
+// Settings
+#define NUM_PIXELS 50
+#define START_UNIVERSE 1
+
+#define ARTNET_BYTES_PER_UNIVERSE 510
+#define OUTPUT_BYTES_PER_UNIVERSE 510*4/3
+
+
+
+// Precompute some useful constants based on the settings
+const int num_universes = (NUM_PIXELS + 169) / 170;
+const int num_complete_universes = NUM_PIXELS / 170;
+const int last_universe = START_UNIVERSE + num_universes - 1;
+const int pixels_in_last_universe = NUM_PIXELS - (num_universes-1) * 170;
+
+const uint32_t bitrate = 32000000; // bps
+
+uint8_t* output_buffer;
 uint32_t* last_arrival_time; // using a cheeky 32 bit int for time
 uint8_t* arrival_flag;
 
@@ -162,7 +174,7 @@ int fd;
 // SPI transfer operation setup.  These are used w/hardware SP.
 static uint8_t header[] = { 0x00, 0x00, 0x00, 0x00 },
                footer[] = { 0xFF, 0xFF, 0xFF, 0xFF };
-static struct spi_ioc_transfer xfers[2][3] = {
+static struct spi_ioc_transfer xfer[3] = {
  { .rx_buf        = 0,
    .len           = sizeof(header),
    .delay_usecs   = 0,
@@ -179,184 +191,76 @@ static struct spi_ioc_transfer xfers[2][3] = {
    .cs_change     = 0 }
 };
 
-// Initialize DotStar object
-static int DotStar_init(DotStarObject *self, PyObject *arg) {
-	uint8_t *ptr;
-	uint32_t i;
-	// Set first byte of each 4-byte pixel to 0xFF, rest to 0x00 (off)
-	for(ptr = self->pixels, i=0; i<self->numLEDs; i++) {
-		*ptr++ = 0xFF; *ptr++ = 0x00; *ptr++ = 0x00; *ptr++ = 0x00;
-	}
-	return 0;
-}
 
 
-
-// Set strip data to 'off' (just clears buffer, does not write to strip)
-static PyObject *clear(DotStarObject *self) {
-	uint8_t *ptr;
-	uint32_t i;
-	for(ptr = self->pixels, i=0; i<self->numLEDs; i++, ptr += 4) {
-		ptr[1] = 0x00; ptr[2] = 0x00; ptr[3] = 0x00;
-	}
-	Py_INCREF(Py_None);
-	return Py_None;
-}
-
-// Valid syntaxes:
-// x.setPixelColor(index, red, green, blue)
-// x.setPixelColor(index, 0x00RRGGBB)
-static PyObject *setPixelColor(DotStarObject *self, PyObject *arg) {
-	uint32_t i, v;
-	uint8_t  r, g, b;
-
-	switch(PyTuple_Size(arg)) {
-	   case 4: // Index, r, g, b
-		if(!PyArg_ParseTuple(arg, "Ibbb", &i, &r, &g, &b))
-			return NULL;
-		break;
-	   case 2: // Index, value
-		if(!PyArg_ParseTuple(arg, "II", &i, &v))
-			return NULL;
-		r = v >> 16;
-		g = v >>  8;
-		b = v;
-		break;
-	   default:
-		return NULL;
-	}
-
-	if(i < self->numLEDs) {
-		uint8_t *ptr = &self->pixels[i * 4 + 1];
-		*ptr++ = b; // Data internally is stored
-		*ptr++ = g; // in BGR order; it's what
-		*ptr++ = r; // the strip expects.
-	}
-
-	Py_INCREF(Py_None);
-	return Py_None;
-}
-
-// Write data in the format used by Dotstar, each pixel gets four bytes, 
-// first is 0xFF, the others are the colour in BGR order
-static void raw_write(DotStarObject *self, uint8_t *ptr, uint32_t len) {
-	if(self->fd >= 0) { // Hardware SPI
-		xfer[1].tx_buf = (unsigned long)ptr;
-		xfer[1].len    = len;
-		// All that spi_ioc_transfer struct stuff earlier in
-		// the code is so we can use this single ioctl to concat
-		// the header/data/footer into one operation:
-		(void)ioctl(self->fd, SPI_IOC_MESSAGE(3), xfer);
-	}
-}
-
-// Issue data to strip.  Optional arg = raw bytearray to issue to strip
-// (else object's pixel buffer is used).  If passing raw data, it must
-// be in strip-ready format (4 bytes/pixel, 0xFF/B/G/R) and no brightness
-// scaling is performed...it's all about speed (for POV & stuff).
-static PyObject *show(DotStarObject *self, PyObject *arg) {
-	if(PyTuple_Size(arg) == 1) { // Raw bytearray passed
-		Py_buffer buf;
-		if(!PyArg_ParseTuple(arg, "s*", &buf)) return NULL;
-		raw_write(self, buf.buf, buf.len);
-		PyBuffer_Release(&buf);
-	} else { // Write object's pixel buffer
-		if(self->brightness == 0) { // Send raw (no scaling)
-			raw_write(self, self->pixels, self->numLEDs * 4);
-		} else { // Adjust brightness during write
-			uint32_t i;
-			uint8_t *ptr   = self->pixels;
-			uint16_t scale = self->brightness;
-			if(self->fd >= 0) { // Hardware SPI
-				// Allocate pBuf if using hardware
-				// SPI and not previously alloc'd
-				if((self->pBuf == NULL) && ((self->pBuf =
-				  (uint8_t *)malloc(self->numLEDs * 4)))) {
-					memset(self->pBuf, 0xFF,
-					  self->numLEDs * 4); // Init MSBs
-				}
-
-				// Scale from 'pixels' buffer into
-				// 'pBuf' (if available) and then
-				// use a single efficient write
-				// operation (thx Eric Bayer).
-				uint8_t *pb = self->pBuf;
-				for(i=0; i<self->numLEDs;
-				  i++, ptr += 4, pb += 4) {
-					pb[1] = (ptr[1] * scale) >> 8;
-					pb[2] = (ptr[2] * scale) >> 8;
-					pb[3] = (ptr[3] * scale) >> 8;
-				}
-				raw_write(self, self->pBuf,
-				  self->numLEDs * 4);
-			} 
-		}
-	}
-
-	Py_INCREF(Py_None);
-	return Py_None;
-}
-
-// Given separate R, G, B, return a packed 32-bit color.
-// Meh, mostly here for parity w/Arduino library.
-static PyObject *Color(DotStarObject *self, PyObject *arg) {
-	uint8_t   r, g, b;
-	PyObject *result;
-
-	if(!PyArg_ParseTuple(arg, "bbb", &r, &g, &b)) return NULL;
-
-	result = Py_BuildValue("I", (r << 16) | (g << 8) | b);
-	Py_INCREF(result);
-	return result;
-}
-
-// Return color of previously-set pixel (as packed 32-bit value)
-static PyObject *getPixelColor(DotStarObject *self, PyObject *arg) {
-	uint32_t  i;
-	uint8_t   r=0, g=0, b=0;
-	PyObject *result;
-
-	if(!PyArg_ParseTuple(arg, "I", &i)) return NULL;
-
-	if(i < self->numLEDs) {
-		uint8_t *ptr = &self->pixels[i * 4 + 1];
-		b = *ptr++; g = *ptr++; r = *ptr++;
-	}
-
-	result = Py_BuildValue("I", (r << 16) | (g << 8) | b);
-	Py_INCREF(result);
-	return result;
-}
-
-static PyObject *_close(DotStarObject *self) {
-	if(self->fd) {
-		close(self->fd);
-		self->fd = -1;
-	} else {
-		INP_GPIO(self->dataPin);
-		INP_GPIO(self->clockPin);
-		self->dataMask  = 0;
-		self->clockMask = 0;
-	}
-	Py_INCREF(Py_None);
-	return Py_None;
-}
-
-static void DotStar_dealloc(DotStarObject *self) {
-	_close(self);
-	if(self->pBuf)   free(self->pBuf);
-	if(self->pixels) free(self->pixels);
-	self->ob_type->tp_free((PyObject *)self);
-}
-
-
-void receiver_loop() {
+// Process a packet. Returns true in most cases, false on fatal errors.
+bool process_packet(int packet_length, const uint8_t* buffer) {
 	
+	// Art-Net headers are 18 bytes
+	if (packet_length <= 18) return true;
+	uint16_t universe = (uint16_t*)buffer[14];
+	uint16_t length = (uint16_t*)buffer[16];
+
+	// Skip packet if things don't add up
+	if (universe < START_UNIVERSE || universe > last_universe) return true;
+  if (universe == last_universe) {
+		if (length != pixels_in_last_universe*3) return true;
+	}
+	else {
+		if (length != ARTNET_BYTES_PER_UNIVERSE) return true;
+	}
+
+	// Accept it without checking more headers
+	//
+	int output_index = universe * OUTPUT_BYTES_PER_UNIVERSE;
+	int input_index = 18;
+	int i;
+
+	for (i=0; i<length; i+=3, input_index+=3, output_index+=4) {
+		output_buffer[output_index+1] = buffer[input_index+2]; // B <- B
+		output_buffer[output_index+2] = buffer[input_index+1]; // G <- G
+		output_buffer[output_index+3] = buffer[input_index];   // R <- R
+	}
+
+	// Determine whether or not to send to strip now
+
+	return true;
 }
 
-int do_led_output(void* arg) {
 
-	return 0;
+bool receiver() {
+	struct sockaddr_in si_me;
+  int s;
+	if (s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP) == -1)
+		return false;
+	memset((char *) &si_me, 0, sizeof(si_me));
+	 
+	si_me.sin_family = AF_INET;
+	si_me.sin_port = htons(ARTNET_PORT);
+	si_me.sin_addr.s_addr = htonl(INADDR_ANY);
+     
+	if (bind(s, (struct sockaddr*)&si_me, sizeof(si_me)) == -1)
+		return false;
+
+	
+	uint8_t buffer[1024];
+	ssize_t len;
+	while(true) {
+		if (len = recv(s, buffer, sizeof(buffer), 0) == -1) 
+			return false;
+
+			
+			if (!process_packet(len, buffer)) 
+				return false;
+	}
+  
+}
+
+int do_led_output() {
+	// All that spi_ioc_transfer struct stuff earlier in
+	// the code is so we can use this single ioctl to concat
+	// the header/data/footer into one operation:
+	(void)ioctl(fd, SPI_IOC_MESSAGE(3), xfer);
 }
 
 bool init() {
@@ -376,37 +280,46 @@ bool init() {
 	// Speed!
 	ioctl(self->fd, SPI_IOC_WR_MAX_SPEED_HZ, bitrate);
 
-	const int buffer_size = num_universes*OUTPUT_BYTES_PER_UNIVERSE;
-	// Set up both I/O data structures, one for each buffer
-	for (int i=0; i<2; ++) {
-		output_buffers[i] = (uint8_t*)malloc(buffer_size);
-		// Initialize leading 0xFF bytes before each pixel (this sets all to 0xFF)
-		memset(output_buffers[i], 0xFF, buffer_size);
-		if (output_buffers[i] == NULL) {
-			fprintf("Unable to allocate data structures (not enough memory?)");
-			return false;
-		}
-		static struct spi_ioc_transfer *xfer = xfers[i];
-		xfer[0].speed_hz = xfer[1].speed_hz = xfer[2].speed_hz = self->bitrate; 
-		// Set up I/O data structures
-		xfer[0].tx_buf = (unsigned long)header;
-		xfer[1].tx_buf = (unsigned long)output_buffers[i];
-		xfer[2].tx_buf = (unsigned long)footer;
+
+	// Set up buffer
+	const int buffer_size = NUM_PIXELS*4;
+	output_buffer = (uint8_t*)malloc(buffer_size);
+	if (output_buffer == NULL) {
+		fprintf("Unable to allocate buffer (not enough memory?)");
+		return false;
+	}
+	// Initialize to black (leading byte must always be 0xFF, three next
+	// bytes are the colours, set to black.
+	for (int i=0; i<buffer_size; i+=4) {
+		output_buffer[i] = 0xFF;
+		output_buffer[i+1] = 0;
+		output_buffer[i+2] = 0;
+		output_buffer[i+3] = 0;
 	}
 
+	xfer[0].speed_hz = xfer[1].speed_hz = xfer[2].speed_hz = self->bitrate; 
+	// Set up SPI output data structures
+	xfer[0].tx_buf = (unsigned long)header;
+	xfer[1].tx_buf = (unsigned long)output_buffer;
+	xfer[1].len = buffer_size;
+	xfer[2].tx_buf = (unsigned long)footer;
+
 	return true;
+}
+
+void cleanup() {
+	close(fd);
 }
 
 int main(int argc, char** argv[]) {
 	
 	if (!init()) {
-		exit(1);
+		return 1;
 	}
-	pthread_t led_thread;
-	pthread_create(&led_thread, NULL, do_led_output, NULL);
-
-	receiver_loop();
-
-	return 0;
+	if (receiver_loop()) {
+		return 0;
+	}
+	cleanup();
+	return 1;
 }
 
