@@ -164,8 +164,9 @@ const int pixels_in_last_universe = NUM_PIXELS - (num_universes-1) * 170;
 const uint32_t bitrate = 32000000; // bps
 
 uint8_t* output_buffer;
-uint32_t* last_arrival_time; // using a cheeky 32 bit int for time
-uint8_t* arrival_flag;
+uint32_t* arrival_time; // using a cheeky 32 bit int for time
+uint32_t last_frame_time;
+bool* arrival_flag;
 
 int startup = 3;
 
@@ -192,6 +193,23 @@ static struct spi_ioc_transfer xfer[3] = {
 };
 
 
+
+bool check_do_led_output(int universe) {
+	int i_universe = universe - FIRST_UNIVERSE;
+	uint32_t time = (uint32_t)clock();
+	arrival_flag[i_universe] = true;
+
+	all_arrived = arrival_flag[0];
+	int i;
+	for (i=1; all_arrived && i<num_universes; ++i)
+		all_arrived = arrival_flag[i];
+
+	if (all_arrived) { // All universes arrived!
+		uint32_t frame_time = 0;
+	}
+
+	return false;
+}
 
 // Process a packet. Returns true in most cases, false on fatal errors.
 bool process_packet(int packet_length, const uint8_t* buffer) {
@@ -222,7 +240,10 @@ bool process_packet(int packet_length, const uint8_t* buffer) {
 		output_buffer[output_index+3] = buffer[input_index];   // R <- R
 	}
 
-	// Determine whether or not to send to strip now
+	// Determine whether or not to send to LED strip now
+	if (check_do_led_output(universe)) {
+		do_led_output();
+	}
 
 	return true;
 }
@@ -266,8 +287,8 @@ int do_led_output() {
 bool init() {
 
 	// Initialize buffers and data structures
-	last_arrival_time = (uint32_t*)malloc(num_universes * sizeof(uint32_t));
-	arrival_flag = (uint8_t*)malloc(num_universes);
+	arrival_time = (uint32_t*)malloc(num_universes * sizeof(uint32_t));
+	arrival_flag = (bool*)malloc(num_universes * sizeof(bool));
 
 	// Set up SPI
 	if((fd = open("/dev/spidev0.0", O_RDWR)) < 0) {
