@@ -10,18 +10,19 @@
  * subset of the Art-Net protocol, needed to push pixels to the strips.
  * The rationale for choosing Art-Net is that it is already a (de facto)
  * standard for lighting control, and the LED strips become available to
- * applications such as Madrix.
+ * applications such as Madrix (http://www.madrix.com/).
  *
  * This code ditches the Python interface and works with C only, it also
- * does not support bit-banging.
+ * does not support bit-banging. It's written in C, but using many 
+ * features from C++, so it won't compile in C-only mode.
  *
  * 	-- Functional overview --
  * 
- * 	The program uses two threads:
+ *  There are two phases: 
+ *    - Collect data for a frame
+ *    - Send data on SPI
  *
- *      o Network receiver thread
- *      o SPI sender thread
- *
+ *  The sync. algorithm is described below. 
  *
  * The code is licensed under the GNU Lesser General Public License.
  * See the Adafruit library for details.
@@ -46,26 +47,122 @@
 // 32768 universes are supported. We only use 510 channels per universe,
 // as this corresponds to the largest number of complete RGB LEDs 
 // possible (170).
-//
-// This program buffers data coming in via UDP until it has loaded a full
-// frame, then sends it (to be determined)
-// Some logic is required to maintain synchronization with the network
-// input.
-//
+
+
+/*
+ * Synchronization algorithm (v0)
+ *
+ * ** Assumptions **
+ *
+ * Updates are divided into frames, which contains values for
+ * all pixels. By necessity, if there is more than 170 pixels, the frame
+ * spans multiple Art-Net universes, and thus multiple UDP
+ * datagrams. The data in a frame is sent in a burst, so there is a much
+ * shorter interval between the packets of a single frame than between 
+ * packets in different frames. The SPI interface is not fast enough
+ * to push a full frame every time a packet (partial frame) is received,
+ * so we must collect full frames before sending to SPI.
+ *
+ * The packets aren't expected to arrive in order. This makes the 
+ * algorithm more complex, but I have no reason to believe that all
+ * software sends universes in any particular order).
+ *
+ * Universe     |--------------- time  ------------------|
+ * 1              d               d             d
+ * 2               d              d              d
+ * 3             d                 d            d
+ * 4                d             d              d
+ *  
+ *  (d = datagram)
+ * 
+ * Dropped packets must be expected. The main challenge is regaining 
+ * synchronization after one or more packets of a frame have been lost.
+ * There is no way to per se identify a packet as belonging to a 
+ * particular frame. While Art-Net does specify a "sequence number"
+ * field, this is not used by the Madrix software, so I have to assume
+ * that it's not commonly used and I can't make use of it.
+ *
+ * The frame rate is not known in advance, but frames are assumed to 
+ * be sent at a fixed rate over reasonably long periods (as if it's a
+ * config parameter of the sending process).
+ * 
+ *
+ * ** Design goals **
+ *
+ * - The algorithm  shouldn't introduce dropped frames or jitter 
+ *   under optimal network conditions.
+ * - Should use a small amount of computing resources and be quick
+ *   (don't care too much about memory efficiency).
+ * - Should regain sync quickly when faced with a moderate packet
+ *   loss.
+ *
+ *
+ * ** Definition of the algorithm **
+ * 
+ * The basis is to record when each universe packet arrives, and send
+ * a frame when all have arrived. A flag is kept for each universe to 
+ * detect whether it has arrived.
+ *
+ * The time of arrival of each packet is recorded. When a full frame is
+ * received, the time between the first and the last packet of the 
+ * frame is computed.
+ *
+ * After each packet is received, the time between the least recently 
+ * arrived packet and the current packet is computed. If this is less
+ * than a third of the last full frame time (as in the previous paragraph),
+ * the current data are considered a full frame, sent to SPI, and 
+ * all universe arrival flags are reset (some were never set, though).
+ * If this condition is never met for a frame (the normal case), the
+ * frame is sent when all universes have arrived.
+ *
+ * The above is the primary synchronization mechanism. Schematically,
+ * a dropped packet is handled like this:
+ *
+ *                            dropped packet
+ *                            v
+ * Universe     |--------------- time  ------------------|
+ * 1             d          d          d             d
+ * 2              d          d         ^d             d
+ * 3               d                   | d             d
+ * 4                d          d       |  d             d
+ *                  ^                  | ^^
+ *                  | Full frame 1     | ||
+ *                  |== frame duration ==|Full frame 2
+ *                                     |  |
+ *                                     |==| Condition triggered
+ *                                          additional frame sent
+ *
+ * A secondary mechanism is to drop frames which are likely to be from
+ * two different true frames, such as the second full frame in the 
+ * above example. If the full frame time exceeds three times the
+ * previous full frame time, the frame is recorded as normal, but not
+ * sent to SPI.
+ *
+ * ** Edge cases **
+ *
+ * When the frame rate gets close to the rate at which one can push 
+ * frames over SPI, or the rate at which one can process packets, 
+ * the sync. algorithm does less, and  
+ *
+ */
 const uint8_t universe_ids[] = {1, 2, 3};
 const uint8_t num_universes = sizeof(universe_ids) / sizeof(const uint8_t);
 const uint8_t universe_data[num_universes * ARTNET_BYTES_PER_UNIVERSE];
 
-const uint32_t bitrate = 8000000;
+const uint32_t bitrate = 32000000;
 
-uint8_t* output_buffer;
+uint8_t* output_buffers[2]; // double buffering
+uint32_t* last_arrival_time; // using a cheeky 32 bit int for time
+uint8_t* arrival_flag;
+
+int startup = 3;
 
 int fd;
 
 // SPI transfer operation setup.  These are used w/hardware SP.
 static uint8_t header[] = { 0x00, 0x00, 0x00, 0x00 },
                footer[] = { 0xFF, 0xFF, 0xFF, 0xFF };
-static struct spi_ioc_transfer xfer[3] = {
+static struct spi_ioc_transfer xfers[2][3] = {
  { .rx_buf        = 0,
    .len           = sizeof(header),
    .delay_usecs   = 0,
@@ -253,38 +350,51 @@ static void DotStar_dealloc(DotStarObject *self) {
 }
 
 
-int spi_thread(void* arg_TODO) {
+void receiver_loop() {
+	
+}
+
+int do_led_output(void* arg) {
+
 	return 0;
 }
 
-int init() {
+bool init() {
+
 	// Initialize buffers and data structures
-	const int buffer_size = num_universes*OUTPUT_BYTES_PER_UNIVERSE;
-	output_buffer = (uint8_t)malloc(buffer_size);
-	if (output_buffer == NULL) {
-		fprintf("Unable to allocate output buffer");
-		return 0;
-	}
-	// Initialize leading 0xFF bytes before each pixel
-	memset(output_buffer, 0xFF, buffer_size);
-
-
+	last_arrival_time = (uint32_t*)malloc(num_universes * sizeof(uint32_t));
+	arrival_flag = (uint8_t*)malloc(num_universes);
 
 	// Set up SPI
 	if((fd = open("/dev/spidev0.0", O_RDWR)) < 0) {
 		printf("Can't open /dev/spidev0.0 (try 'sudo')\n");
-		return 0;
+		return false;
 	}
 	// Mode=0 and no chipselect copied from Adafruit's code
 	uint8_t mode = SPI_MODE_0 | SPI_NO_CS;
 	ioctl(fd, SPI_IOC_WR_MODE, &mode);
+	// Speed!
 	ioctl(self->fd, SPI_IOC_WR_MAX_SPEED_HZ, bitrate);
-	xfer[0].speed_hz = xfer[1].speed_hz = xfer[2].speed_hz = self->bitrate; 
-	// 
-	xfer[0].tx_buf = (unsigned long)header;
-	xfer[2].tx_buf = (unsigned long)footer;
 
-	return 1;
+	const int buffer_size = num_universes*OUTPUT_BYTES_PER_UNIVERSE;
+	// Set up both I/O data structures, one for each buffer
+	for (int i=0; i<2; ++) {
+		output_buffers[i] = (uint8_t*)malloc(buffer_size);
+		// Initialize leading 0xFF bytes before each pixel (this sets all to 0xFF)
+		memset(output_buffers[i], 0xFF, buffer_size);
+		if (output_buffers[i] == NULL) {
+			fprintf("Unable to allocate data structures (not enough memory?)");
+			return false;
+		}
+		static struct spi_ioc_transfer *xfer = xfers[i];
+		xfer[0].speed_hz = xfer[1].speed_hz = xfer[2].speed_hz = self->bitrate; 
+		// Set up I/O data structures
+		xfer[0].tx_buf = (unsigned long)header;
+		xfer[1].tx_buf = (unsigned long)output_buffers[i];
+		xfer[2].tx_buf = (unsigned long)footer;
+	}
+
+	return true;
 }
 
 int main(int argc, char** argv[]) {
@@ -292,7 +402,11 @@ int main(int argc, char** argv[]) {
 	if (!init()) {
 		exit(1);
 	}
-	pthread_create();
+	pthread_t led_thread;
+	pthread_create(&led_thread, NULL, do_led_output, NULL);
+
+	receiver_loop();
+
 	return 0;
 }
 
