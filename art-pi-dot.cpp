@@ -30,10 +30,12 @@
 
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
-#include <pthread.h>
 #include <linux/spi/spidev.h>
+#include <string.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
@@ -204,23 +206,33 @@ void dbg(const char* msg) {
 uint32_t get_first_arrival() {
 	uint32_t min = arrival_time[0];
 	for (int i=1; i<num_universes; ++i)
-		min = min(min, arrival_time[i]);
+		if (arrival_time[i] < min)
+			min = arrival_time[i];
 	return min;
 }
 
-void mark_frame_sent(uint32_t time) {
+void mark_frame_sent(uint32_t first_arrival) {
 	int i;
 	for (i=0; i<num_universes; ++i) {
 		arrival_flag[i] = false;
 	}
+	uint32_t frame_time = ((uint32_t)clock() - first_arrival);
+	last_frame_time = frame_time;
+}
+
+int do_led_output() {
+	// All that spi_ioc_transfer struct stuff earlier in
+	// the code is so we can use this single ioctl to concat
+	// the header/data/footer into one operation:
+	(void)ioctl(fd, SPI_IOC_MESSAGE(3), xfer);
 }
 
 void check_do_led_output(int universe) {
-	int i_universe = universe - FIRST_UNIVERSE;
+	int i_universe = universe - START_UNIVERSE;
 	uint32_t time = (uint32_t)clock();
 	arrival_flag[i_universe] = true;
 
-	all_arrived = arrival_flag[0];
+	bool all_arrived = arrival_flag[0];
 	int i;
 	for (i=1; all_arrived && i<num_universes; ++i)
 		all_arrived = arrival_flag[i];
@@ -233,18 +245,13 @@ void check_do_led_output(int universe) {
 		if (frame_time * 3 < last_frame_time) {
 			do_led_output();
 		}
-		mark_frame_sent();
-		frame_time = ((uint32_t)clock() - first_arrival);
-		last_frame_time = frame_time;
+		mark_frame_sent(first_arrival);
 	}
 	else {
 		if (frame_time * 3 < last_frame_time) {
 			DBG("Sending the packet even though not all arrived!");
 			do_led_output();
-			mark_frame_sent();
-			mark_frame_sent();
-			frame_time = ((uint32_t)clock() - first_arrival);
-			last_frame_time = frame_time;
+			mark_frame_sent(first_arrival);
 		}
 	}
 }
@@ -254,8 +261,8 @@ bool process_packet(int packet_length, const uint8_t* buffer) {
 	
 	// Art-Net headers are 18 bytes
 	if (packet_length <= 18) return true;
-	uint16_t universe = (uint16_t*)buffer[14];
-	uint16_t length = (uint16_t*)buffer[16];
+	uint16_t universe = *(uint16_t*)(buffer + 14);
+	uint16_t length = *(uint16_t*)(buffer + 16);
 
 	// Skip packet if things don't add up
 	if (universe < START_UNIVERSE || universe > last_universe) return true;
@@ -312,12 +319,6 @@ bool receiver() {
   
 }
 
-int do_led_output() {
-	// All that spi_ioc_transfer struct stuff earlier in
-	// the code is so we can use this single ioctl to concat
-	// the header/data/footer into one operation:
-	(void)ioctl(fd, SPI_IOC_MESSAGE(3), xfer);
-}
 
 bool init() {
 
@@ -334,14 +335,14 @@ bool init() {
 	uint8_t mode = SPI_MODE_0 | SPI_NO_CS;
 	ioctl(fd, SPI_IOC_WR_MODE, &mode);
 	// Speed!
-	ioctl(self->fd, SPI_IOC_WR_MAX_SPEED_HZ, bitrate);
+	ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, bitrate);
 
 
 	// Set up buffer
 	const int buffer_size = NUM_PIXELS*4;
 	output_buffer = (uint8_t*)malloc(buffer_size);
 	if (output_buffer == NULL) {
-		fprintf("Unable to allocate buffer (not enough memory?)");
+		printf("Unable to allocate buffer (not enough memory?)");
 		return false;
 	}
 	// Initialize to black (leading byte must always be 0xFF, three next
@@ -353,7 +354,7 @@ bool init() {
 		output_buffer[i+3] = 0;
 	}
 
-	xfer[0].speed_hz = xfer[1].speed_hz = xfer[2].speed_hz = self->bitrate; 
+	xfer[0].speed_hz = xfer[1].speed_hz = xfer[2].speed_hz = bitrate; 
 	// Set up SPI output data structures
 	xfer[0].tx_buf = (unsigned long)header;
 	xfer[1].tx_buf = (unsigned long)output_buffer;
@@ -364,15 +365,14 @@ bool init() {
 }
 
 void cleanup() {
-	close(fd);
 }
 
-int main(int argc, char** argv[]) {
+int main(int argc, char** argv) {
 	
 	if (!init()) {
 		return 1;
 	}
-	if (receiver_loop()) {
+	if (receiver()) {
 		return 0;
 	}
 	cleanup();
