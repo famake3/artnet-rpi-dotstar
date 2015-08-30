@@ -29,6 +29,7 @@
  *------------------------------------------------------------------------*/
 
 #include <fcntl.h>
+#include <stdio.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <pthread.h>
@@ -155,6 +156,10 @@
 
 
 
+#define DEBUG 1
+#define DBG(x) if(DEBUG) dbg(x);
+
+
 // Precompute some useful constants based on the settings
 const int num_universes = (NUM_PIXELS + 169) / 170;
 const int num_complete_universes = NUM_PIXELS / 170;
@@ -192,9 +197,25 @@ static struct spi_ioc_transfer xfer[3] = {
    .cs_change     = 0 }
 };
 
+void dbg(const char* msg) {
+	printf("[%03d] %s\n", (int)(clock() / 1000), msg);
+}
 
+uint32_t get_first_arrival() {
+	uint32_t min = arrival_time[0];
+	for (int i=1; i<num_universes; ++i)
+		min = min(min, arrival_time[i]);
+	return min;
+}
 
-bool check_do_led_output(int universe) {
+void mark_frame_sent(uint32_t time) {
+	int i;
+	for (i=0; i<num_universes; ++i) {
+		arrival_flag[i] = false;
+	}
+}
+
+void check_do_led_output(int universe) {
 	int i_universe = universe - FIRST_UNIVERSE;
 	uint32_t time = (uint32_t)clock();
 	arrival_flag[i_universe] = true;
@@ -204,11 +225,28 @@ bool check_do_led_output(int universe) {
 	for (i=1; all_arrived && i<num_universes; ++i)
 		all_arrived = arrival_flag[i];
 
-	if (all_arrived) { // All universes arrived!
-		uint32_t frame_time = 0;
-	}
+	uint32_t first_arrival = get_first_arrival();
+	uint32_t frame_time = (uint32_t)(clock() - first_arrival);
 
-	return false;
+	if (all_arrived) { // All universes arrived!
+		DBG("All have arrived, sending");
+		if (frame_time * 3 < last_frame_time) {
+			do_led_output();
+		}
+		mark_frame_sent();
+		frame_time = ((uint32_t)clock() - first_arrival);
+		last_frame_time = frame_time;
+	}
+	else {
+		if (frame_time * 3 < last_frame_time) {
+			DBG("Sending the packet even though not all arrived!");
+			do_led_output();
+			mark_frame_sent();
+			mark_frame_sent();
+			frame_time = ((uint32_t)clock() - first_arrival);
+			last_frame_time = frame_time;
+		}
+	}
 }
 
 // Process a packet. Returns true in most cases, false on fatal errors.
@@ -221,13 +259,14 @@ bool process_packet(int packet_length, const uint8_t* buffer) {
 
 	// Skip packet if things don't add up
 	if (universe < START_UNIVERSE || universe > last_universe) return true;
-  if (universe == last_universe) {
+	if (universe == last_universe) {
 		if (length != pixels_in_last_universe*3) return true;
 	}
 	else {
 		if (length != ARTNET_BYTES_PER_UNIVERSE) return true;
 	}
 
+	DBG("Received a valid packet!\n");
 	// Accept it without checking more headers
 	//
 	int output_index = universe * OUTPUT_BYTES_PER_UNIVERSE;
@@ -240,12 +279,8 @@ bool process_packet(int packet_length, const uint8_t* buffer) {
 		output_buffer[output_index+3] = buffer[input_index];   // R <- R
 	}
 
-	// Determine whether or not to send to LED strip now
-	if (check_do_led_output(universe)) {
-		do_led_output();
-	}
-
-	return true;
+	// Send to LED strip now if required
+	check_do_led_output(universe);
 }
 
 
