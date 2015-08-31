@@ -159,7 +159,7 @@
 
 
 #define DEBUG 1
-#define DBG(x) if(DEBUG) dbg(x);
+#define DBG(msg) if(DEBUG) printf("[%03d] %s\n", (int)(clock() / 1000), msg); 
 
 
 // Precompute some useful constants based on the settings
@@ -198,10 +198,6 @@ static struct spi_ioc_transfer xfer[3] = {
    .bits_per_word = 8,
    .cs_change     = 0 }
 };
-
-void dbg(const char* msg) {
-	printf("[%03d] %s\n", (int)(clock() / 1000), msg);
-}
 
 uint32_t get_first_arrival() {
 	uint32_t min = arrival_time[0];
