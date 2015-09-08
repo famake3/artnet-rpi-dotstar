@@ -1,6 +1,6 @@
 /*------------------------------------------------------------------------
  *
- *  Famake's Art-Net -> DotStar SPI proxy
+ *  Famake's Art-Net -> DotStar SPI gateway
  *
  *
  * Based on Adafruit DotStar Raspberry Pi lib 
@@ -182,22 +182,7 @@ int fd;
 // SPI transfer operation setup.  These are used w/hardware SP.
 static uint8_t header[] = { 0x00, 0x00, 0x00, 0x00 },
                footer[] = { 0xFF, 0xFF, 0xFF, 0xFF };
-static struct spi_ioc_transfer xfer[3] = {
- { .rx_buf        = 0,
-   .len           = sizeof(header),
-   .delay_usecs   = 0,
-   .bits_per_word = 8,
-   .cs_change     = 0 },
- { .rx_buf        = 0,
-   .delay_usecs   = 0,
-   .bits_per_word = 8,
-   .cs_change     = 0 },
- { .rx_buf        = 0,
-   .len           = sizeof(footer),
-   .delay_usecs   = 0,
-   .bits_per_word = 8,
-   .cs_change     = 0 }
-};
+static struct spi_ioc_transfer xfer[3];
 
 uint32_t get_first_arrival() {
 	uint32_t min = arrival_time[0];
@@ -216,11 +201,11 @@ void mark_frame_sent(uint32_t first_arrival) {
 	last_frame_time = frame_time;
 }
 
-int do_led_output() {
+int do_output() {
 	// All that spi_ioc_transfer struct stuff earlier in
 	// the code is so we can use this single ioctl to concat
 	// the header/data/footer into one operation:
-	(void)ioctl(fd, SPI_IOC_MESSAGE(3), xfer);
+	//(void)ioctl(fd, SPI_IOC_MESSAGE(3), xfer);
 }
 
 void check_do_led_output(int universe) {
@@ -239,14 +224,14 @@ void check_do_led_output(int universe) {
 	if (all_arrived) { // All universes arrived!
 		DBG("All have arrived, sending");
 		if (frame_time * 3 < last_frame_time) {
-			do_led_output();
+			do_output();
 		}
 		mark_frame_sent(first_arrival);
 	}
 	else {
 		if (frame_time * 3 < last_frame_time) {
 			DBG("Sending the packet even though not all arrived!");
-			do_led_output();
+			do_output();
 			mark_frame_sent(first_arrival);
 		}
 	}
@@ -288,18 +273,22 @@ bool process_packet(int packet_length, const uint8_t* buffer) {
 
 
 bool receiver() {
-	struct sockaddr_in si_me;
   int s;
-	if (s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP) == -1)
+	if ((s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
+    perror("socket");
 		return false;
+	}
+
+	struct sockaddr_in si_me;
 	memset((char *) &si_me, 0, sizeof(si_me));
-	 
 	si_me.sin_family = AF_INET;
 	si_me.sin_port = htons(ARTNET_PORT);
 	si_me.sin_addr.s_addr = htonl(INADDR_ANY);
      
-	if (bind(s, (struct sockaddr*)&si_me, sizeof(si_me)) == -1)
+	if (bind(s, (struct sockaddr*)&si_me, sizeof(si_me)) == -1) {
+    perror("bind");
 		return false;
+	}
 
 	
 	uint8_t buffer[1024];
@@ -317,11 +306,12 @@ bool receiver() {
 
 
 bool init() {
+	int i;
 
 	// Initialize buffers and data structures
 	arrival_time = (uint32_t*)malloc(num_universes * sizeof(uint32_t));
 	arrival_flag = (bool*)malloc(num_universes * sizeof(bool));
-
+/*
 	// Set up SPI
 	if((fd = open("/dev/spidev0.0", O_RDWR)) < 0) {
 		printf("Can't open /dev/spidev0.0 (try 'sudo')\n");
@@ -333,29 +323,40 @@ bool init() {
 	// Speed!
 	ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, bitrate);
 
+	*/
 
 	// Set up buffer
 	const int buffer_size = NUM_PIXELS*4;
 	output_buffer = (uint8_t*)malloc(buffer_size);
 	if (output_buffer == NULL) {
-		printf("Unable to allocate buffer (not enough memory?)");
+		printf("Unable to allocate buffer (not enough memory?)\n");
 		return false;
 	}
 	// Initialize to black (leading byte must always be 0xFF, three next
 	// bytes are the colours, set to black.
-	for (int i=0; i<buffer_size; i+=4) {
+	for (i=0; i<buffer_size; i+=4) {
 		output_buffer[i] = 0xFF;
 		output_buffer[i+1] = 0;
 		output_buffer[i+2] = 0;
 		output_buffer[i+3] = 0;
 	}
 
-	xfer[0].speed_hz = xfer[1].speed_hz = xfer[2].speed_hz = bitrate; 
 	// Set up SPI output data structures
+	memset((char*) xfer, 0, sizeof(xfer));
+	for (i=0; i<3; ++i) {
+		xfer[i].rx_buf = 0;
+		xfer[i].delay_usecs = 0;
+		xfer[i].bits_per_word = 8;
+		xfer[i].cs_change = 0;
+		xfer[i].speed_hz = bitrate;
+	}
+
 	xfer[0].tx_buf = (unsigned long)header;
 	xfer[1].tx_buf = (unsigned long)output_buffer;
-	xfer[1].len = buffer_size;
 	xfer[2].tx_buf = (unsigned long)footer;
+	xfer[0].len = sizeof(header);
+	xfer[1].len = buffer_size;
+ 	xfer[2].len = sizeof(footer);;
 
 	return true;
 }
@@ -368,10 +369,9 @@ int main(int argc, char** argv) {
 	if (!init()) {
 		return 1;
 	}
-	if (receiver()) {
-		return 0;
-	}
+	bool ok = receiver(); // will only return on error, just prefer it this way
 	cleanup();
-	return 1;
+	if (ok) return 0;
+	else return 1;
 }
 

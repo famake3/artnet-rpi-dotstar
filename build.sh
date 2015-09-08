@@ -1,4 +1,4 @@
 #!/bin/sh
 
-cc -o art-pi-dot art-pi-dot.c
+cc -o art-pi-dot art-pi-dot.cpp
 
