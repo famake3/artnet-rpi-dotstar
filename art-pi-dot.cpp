@@ -150,8 +150,8 @@
 
 
 // Settings
-#define NUM_PIXELS 50
-#define START_UNIVERSE 1
+#define NUM_PIXELS 200
+#define START_UNIVERSE 0
 
 #define ARTNET_BYTES_PER_UNIVERSE 510
 #define OUTPUT_BYTES_PER_UNIVERSE 510*4/3
@@ -159,7 +159,7 @@
 
 
 #define DEBUG 1
-#define DBG(msg) if(DEBUG) printf("[%03d] %s\n", (int)(clock() / 1000), msg); 
+#define DBG(msg) if(DEBUG) printf("[%03d] %s\n", (int)(clock() % 1000), msg); 
 
 
 // Precompute some useful constants based on the settings
@@ -240,21 +240,38 @@ void check_do_led_output(int universe) {
 // Process a packet. Returns true in most cases, false on fatal errors.
 bool process_packet(int packet_length, const uint8_t* buffer) {
 	
-	// Art-Net headers are 18 bytes
-	if (packet_length <= 18) return true;
-	uint16_t universe = *(uint16_t*)(buffer + 14);
-	uint16_t length = *(uint16_t*)(buffer + 16);
+	if (packet_length <= 18) {
+		DBG("Too small packet");
+		return true;
+	}
+	uint16_t universe = *(const uint16_t*)(buffer + 14);
+	//uint16_t length = *(uint16_t*)(buffer + 16);
+	uint16_t length = buffer[17] | (((uint16_t)buffer[16]) << 8);
 
 	// Skip packet if things don't add up
-	if (universe < START_UNIVERSE || universe > last_universe) return true;
+	if (universe < START_UNIVERSE || universe > last_universe) {
+		DBG("Not our universe received");
+		return true;
+	}
 	if (universe == last_universe) {
-		if (length != pixels_in_last_universe*3) return true;
+		if (length != pixels_in_last_universe*3) {
+			DBG("Invalid number of pixels received");
+			printf("Got %d data\n", length);
+			return true;
+		}
 	}
 	else {
-		if (length != ARTNET_BYTES_PER_UNIVERSE) return true;
+		if (length != ARTNET_BYTES_PER_UNIVERSE) {
+			DBG("Invalid number of pixels received");
+			return true;
+		}
 	}
 
-	DBG("Received a valid packet!\n");
+	if (packet_length < length + 18) {
+		DBG("Actual packet length shorter than specified length");
+	}
+
+	DBG("Received a valid packet!");
 	// Accept it without checking more headers
 	//
 	int output_index = universe * OUTPUT_BYTES_PER_UNIVERSE;
@@ -269,6 +286,7 @@ bool process_packet(int packet_length, const uint8_t* buffer) {
 
 	// Send to LED strip now if required
 	check_do_led_output(universe);
+	return true;
 }
 
 
@@ -294,10 +312,9 @@ bool receiver() {
 	uint8_t buffer[1024];
 	ssize_t len;
 	while(true) {
-		if (len = recv(s, buffer, sizeof(buffer), 0) == -1) 
+		if ((len = recv(s, buffer, sizeof(buffer), 0)) == -1) 
 			return false;
-
-			
+		
 			if (!process_packet(len, buffer)) 
 				return false;
 	}
