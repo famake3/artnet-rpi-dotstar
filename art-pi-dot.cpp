@@ -205,7 +205,7 @@ int do_output() {
 	// All that spi_ioc_transfer struct stuff earlier in
 	// the code is so we can use this single ioctl to concat
 	// the header/data/footer into one operation:
-	//(void)ioctl(fd, SPI_IOC_MESSAGE(3), xfer);
+	(void)ioctl(fd, SPI_IOC_MESSAGE(3), xfer);
 }
 
 void check_do_led_output(int universe) {
@@ -328,7 +328,7 @@ bool init() {
 	// Initialize buffers and data structures
 	arrival_time = (uint32_t*)malloc(num_universes * sizeof(uint32_t));
 	arrival_flag = (bool*)malloc(num_universes * sizeof(bool));
-/*
+
 	// Set up SPI
 	if((fd = open("/dev/spidev0.0", O_RDWR)) < 0) {
 		printf("Can't open /dev/spidev0.0 (try 'sudo')\n");
@@ -339,8 +339,6 @@ bool init() {
 	ioctl(fd, SPI_IOC_WR_MODE, &mode);
 	// Speed!
 	ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, bitrate);
-
-	*/
 
 	// Set up buffer
 	const int buffer_size = NUM_PIXELS*4;
