@@ -150,8 +150,8 @@
 
 
 // Settings
-#define NUM_PIXELS 200
-#define START_UNIVERSE 0
+#define NUM_PIXELS 183
+#define START_UNIVERSE 7
 
 #define ARTNET_BYTES_PER_UNIVERSE 510
 #define OUTPUT_BYTES_PER_UNIVERSE 510*4/3
@@ -165,28 +165,30 @@
 // Precompute some useful constants based on the settings
 const int num_universes = (NUM_PIXELS + 169) / 170;
 const int num_complete_universes = NUM_PIXELS / 170;
-const int last_universe = START_UNIVERSE + num_universes - 1;
-const int pixels_in_last_universe = NUM_PIXELS - (num_universes-1) * 170;
+int last_universe;
+int pixels_in_last_universe;
 
-const uint32_t bitrate = 32000000; // bps
+//const uint32_t bitrate = 32000000; // bps
+uint32_t bitrate = 8000000; // bps
 
 uint8_t* output_buffer;
 uint32_t* arrival_time; // using a cheeky 32 bit int for time
 uint32_t last_frame_time;
-bool* arrival_flag;
+int* arrival_flag;
 
 int startup = 3;
 
 int fd;
 
 // SPI transfer operation setup.  These are used w/hardware SP.
-static uint8_t header[] = { 0x00, 0x00, 0x00, 0x00 },
-               footer[] = { 0xFF, 0xFF, 0xFF, 0xFF };
+//static uint8_t header[] = { 0x00, 0x00, 0x00, 0x00 },
+//               footer[] = { 0xFF, 0xFF, 0xFF, 0xFF };
 static struct spi_ioc_transfer xfer[3];
 
 uint32_t get_first_arrival() {
 	uint32_t min = arrival_time[0];
-	for (int i=1; i<num_universes; ++i)
+	int i;
+	for (i=1; i<num_universes; ++i)
 		if (arrival_time[i] < min)
 			min = arrival_time[i];
 	return min;
@@ -195,7 +197,7 @@ uint32_t get_first_arrival() {
 void mark_frame_sent(uint32_t first_arrival) {
 	int i;
 	for (i=0; i<num_universes; ++i) {
-		arrival_flag[i] = false;
+		arrival_flag[i] = 0;
 	}
 	uint32_t frame_time = ((uint32_t)clock() - first_arrival);
 	last_frame_time = frame_time;
@@ -205,15 +207,17 @@ int do_output() {
 	// All that spi_ioc_transfer struct stuff earlier in
 	// the code is so we can use this single ioctl to concat
 	// the header/data/footer into one operation:
-	(void)ioctl(fd, SPI_IOC_MESSAGE(3), xfer);
+	if (ioctl(fd, SPI_IOC_MESSAGE(3), xfer) < 0) {
+		perror("sending data");
+	}
 }
 
 void check_do_led_output(int universe) {
 	int i_universe = universe - START_UNIVERSE;
 	uint32_t time = (uint32_t)clock();
-	arrival_flag[i_universe] = true;
+	arrival_flag[i_universe] = 1;
 
-	bool all_arrived = arrival_flag[0];
+	int all_arrived = arrival_flag[0];
 	int i;
 	for (i=1; all_arrived && i<num_universes; ++i)
 		all_arrived = arrival_flag[i];
@@ -238,11 +242,11 @@ void check_do_led_output(int universe) {
 }
 
 // Process a packet. Returns true in most cases, false on fatal errors.
-bool process_packet(int packet_length, const uint8_t* buffer) {
+int process_packet(int packet_length, const uint8_t* buffer) {
 	
 	if (packet_length <= 18) {
 		DBG("Too small packet");
-		return true;
+		return 1;
 	}
 	uint16_t universe = *(const uint16_t*)(buffer + 14);
 	//uint16_t length = *(uint16_t*)(buffer + 16);
@@ -251,19 +255,20 @@ bool process_packet(int packet_length, const uint8_t* buffer) {
 	// Skip packet if things don't add up
 	if (universe < START_UNIVERSE || universe > last_universe) {
 		DBG("Not our universe received");
-		return true;
+		return 1;
 	}
 	if (universe == last_universe) {
-		if (length != pixels_in_last_universe*3) {
+		if (length > ARTNET_BYTES_PER_UNIVERSE) {
 			DBG("Invalid number of pixels received");
 			printf("Got %d data\n", length);
-			return true;
+			return 1;
 		}
+		length = pixels_in_last_universe*3;
 	}
 	else {
 		if (length != ARTNET_BYTES_PER_UNIVERSE) {
 			DBG("Invalid number of pixels received");
-			return true;
+			return 1;
 		}
 	}
 
@@ -286,15 +291,15 @@ bool process_packet(int packet_length, const uint8_t* buffer) {
 
 	// Send to LED strip now if required
 	check_do_led_output(universe);
-	return true;
+	return 1;
 }
 
 
-bool receiver() {
+int receiver() {
   int s;
 	if ((s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
     perror("socket");
-		return false;
+		return 0;
 	}
 
 	struct sockaddr_in si_me;
@@ -305,47 +310,62 @@ bool receiver() {
      
 	if (bind(s, (struct sockaddr*)&si_me, sizeof(si_me)) == -1) {
     perror("bind");
-		return false;
+		return 0;
 	}
 
 	
 	uint8_t buffer[1024];
 	ssize_t len;
-	while(true) {
+	while(1) {
 		if ((len = recv(s, buffer, sizeof(buffer), 0)) == -1) 
-			return false;
+			return 0;
 		
 			if (!process_packet(len, buffer)) 
-				return false;
+				return 0;
 	}
   
 }
 
 
-bool init() {
+int init() {
 	int i;
+	
+	last_universe = START_UNIVERSE + num_universes - 1;
+	pixels_in_last_universe = NUM_PIXELS - (num_universes-1) * 170;
 
 	// Initialize buffers and data structures
 	arrival_time = (uint32_t*)malloc(num_universes * sizeof(uint32_t));
-	arrival_flag = (bool*)malloc(num_universes * sizeof(bool));
+	arrival_flag = (int*)malloc(num_universes * sizeof(int));
 
 	// Set up SPI
 	if((fd = open("/dev/spidev0.0", O_RDWR)) < 0) {
 		printf("Can't open /dev/spidev0.0 (try 'sudo')\n");
-		return false;
+		return 0;
 	}
 	// Mode=0 and no chipselect copied from Adafruit's code
 	uint8_t mode = SPI_MODE_0 | SPI_NO_CS;
-	ioctl(fd, SPI_IOC_WR_MODE, &mode);
+	
+	if (ioctl(fd, SPI_IOC_WR_MODE, &mode) < 0)
+		printf("Looks like the SPI_IOC_WR_MODE ioctl failed!\n");
+
 	// Speed!
-	ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, bitrate);
+	int err;
+	if ((err = ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &bitrate)) < 0) {
+		printf("Looks like the SPI_IOC_WR_MAX_SPEED_HZ ioctl failed: %d!\n", err);
+		perror("ioctl");
+	}
+	uint8_t bpw = 8;
+	if ((err = ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bpw)) < 0) {
+		printf("Looks like the SPI_IOC_WR_BITS_PER_WORD  ioctl failed: %d!\n", err);
+		perror("ioctl");
+	}
 
 	// Set up buffer
 	const int buffer_size = NUM_PIXELS*4;
 	output_buffer = (uint8_t*)malloc(buffer_size);
 	if (output_buffer == NULL) {
 		printf("Unable to allocate buffer (not enough memory?)\n");
-		return false;
+		return 0;
 	}
 	// Initialize to black (leading byte must always be 0xFF, three next
 	// bytes are the colours, set to black.
@@ -357,23 +377,15 @@ bool init() {
 	}
 
 	// Set up SPI output data structures
-	memset((char*) xfer, 0, sizeof(xfer));
-	for (i=0; i<3; ++i) {
-		xfer[i].rx_buf = 0;
-		xfer[i].delay_usecs = 0;
-		xfer[i].bits_per_word = 8;
-		xfer[i].cs_change = 0;
-		xfer[i].speed_hz = bitrate;
-	}
-
-	xfer[0].tx_buf = (unsigned long)header;
+	memset((char*) xfer, 0, sizeof(xfer)*3);
+	xfer[0].tx_buf = 0;//(unsigned long)header;
 	xfer[1].tx_buf = (unsigned long)output_buffer;
-	xfer[2].tx_buf = (unsigned long)footer;
-	xfer[0].len = sizeof(header);
+	xfer[2].tx_buf = 0; //(unsigned long)footer;
+	xfer[0].len = 4;
 	xfer[1].len = buffer_size;
- 	xfer[2].len = sizeof(footer);;
+ 	xfer[2].len = (NUM_PIXELS + 15) / 16;
 
-	return true;
+	return 1;
 }
 
 void cleanup() {
@@ -384,7 +396,7 @@ int main(int argc, char** argv) {
 	if (!init()) {
 		return 1;
 	}
-	bool ok = receiver(); // will only return on error, just prefer it this way
+	int ok = receiver(); // will only return on error, just prefer it this way
 	cleanup();
 	if (ok) return 0;
 	else return 1;
