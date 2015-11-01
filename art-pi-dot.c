@@ -34,6 +34,7 @@
 #include <time.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
 #include <linux/spi/spidev.h>
 #include <string.h>
 #include <arpa/inet.h>
@@ -158,7 +159,7 @@
 
 
 
-#define DEBUG 1
+#define DEBUG 0
 #define DBG(msg) if(DEBUG) printf("[%03d] %s\n", (int)(clock() % 1000), msg); 
 
 
@@ -173,8 +174,10 @@ uint32_t bitrate = 8000000; // bps
 
 uint8_t* output_buffer;
 uint32_t* arrival_time; // using a cheeky 32 bit int for time
-uint32_t last_frame_time;
+uint32_t last_frame_time = 0xFFFFFF;
+uint32_t last_frame_output = 0;
 int* arrival_flag;
+struct timeval ts;
 
 int startup = 3;
 
@@ -185,21 +188,22 @@ int fd;
 //               footer[] = { 0xFF, 0xFF, 0xFF, 0xFF };
 static struct spi_ioc_transfer xfer[3];
 
-uint32_t get_first_arrival() {
-	uint32_t min = arrival_time[0];
+uint32_t get_frame_time(uint32_t now) {
+	uint32_t max = 0;
 	int i;
-	for (i=1; i<num_universes; ++i)
-		if (arrival_time[i] < min)
-			min = arrival_time[i];
-	return min;
+	for (i=0; i<num_universes; ++i) {
+		uint32_t cand = now - arrival_time[i];
+		if (cand > max)
+			max = cand;
+	}
+	return max;
 }
 
-void mark_frame_sent(uint32_t first_arrival) {
+void mark_frame_sent(uint32_t frame_time) {
 	int i;
 	for (i=0; i<num_universes; ++i) {
 		arrival_flag[i] = 0;
 	}
-	uint32_t frame_time = ((uint32_t)clock() - first_arrival);
 	last_frame_time = frame_time;
 }
 
@@ -214,29 +218,36 @@ int do_output() {
 
 void check_do_led_output(int universe) {
 	int i_universe = universe - START_UNIVERSE;
-	uint32_t time = (uint32_t)clock();
+	gettimeofday(&ts, NULL);
+	uint32_t time = (uint32_t)(ts.tv_sec*1000000 + ts.tv_usec);
 	arrival_flag[i_universe] = 1;
+	arrival_time[i_universe] = time;
 
 	int all_arrived = arrival_flag[0];
 	int i;
 	for (i=1; all_arrived && i<num_universes; ++i)
 		all_arrived = arrival_flag[i];
 
-	uint32_t first_arrival = get_first_arrival();
-	uint32_t frame_time = (uint32_t)(clock() - first_arrival);
+	uint32_t frame_time = get_frame_time(time);
 
 	if (all_arrived) { // All universes arrived!
 		DBG("All have arrived, sending");
-		if (frame_time * 3 < last_frame_time) {
+		if (frame_time < last_frame_time * 3 ||
+			(time - last_frame_output) > (last_frame_time * 10)) {
 			do_output();
 		}
-		mark_frame_sent(first_arrival);
+		else {
+			DBG("Nope, timeout.");
+		}
+		last_frame_output = time;
+		mark_frame_sent(frame_time);
 	}
 	else {
 		if (frame_time * 3 < last_frame_time) {
 			DBG("Sending the packet even though not all arrived!");
 			do_output();
-			mark_frame_sent(first_arrival);
+			last_frame_output = time;
+			mark_frame_sent(frame_time);
 		}
 	}
 }
@@ -255,6 +266,8 @@ int process_packet(int packet_length, const uint8_t* buffer) {
 	// Skip packet if things don't add up
 	if (universe < START_UNIVERSE || universe > last_universe) {
 		DBG("Not our universe received");
+		printf("received %d, start universe %d, last universe %d\n", 
+			universe, START_UNIVERSE, last_universe);
 		return 1;
 	}
 	if (universe == last_universe) {
@@ -279,7 +292,7 @@ int process_packet(int packet_length, const uint8_t* buffer) {
 	DBG("Received a valid packet!");
 	// Accept it without checking more headers
 	//
-	int output_index = universe * OUTPUT_BYTES_PER_UNIVERSE;
+	int output_index = (universe-START_UNIVERSE) * OUTPUT_BYTES_PER_UNIVERSE;
 	int input_index = 18;
 	int i;
 
@@ -377,10 +390,10 @@ int init() {
 	}
 
 	// Set up SPI output data structures
-	memset((char*) xfer, 0, sizeof(xfer)*3);
-	xfer[0].tx_buf = 0;//(unsigned long)header;
+	memset((char*) xfer, 0, sizeof(xfer));
+	xfer[0].tx_buf = 0;
 	xfer[1].tx_buf = (unsigned long)output_buffer;
-	xfer[2].tx_buf = 0; //(unsigned long)footer;
+	xfer[2].tx_buf = 0;
 	xfer[0].len = 4;
 	xfer[1].len = buffer_size;
  	xfer[2].len = (NUM_PIXELS + 15) / 16;
