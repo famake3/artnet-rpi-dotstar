@@ -39,6 +39,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <errno.h>
 
 
 // Configuring the Art-Net universes. Art-Net has a hierarchical 
@@ -151,8 +152,8 @@
 
 
 // Settings
-#define NUM_PIXELS 183
-#define START_UNIVERSE 7
+int NUM_PIXELS = 0;
+int START_UNIVERSE = 0;
 
 #define ARTNET_BYTES_PER_UNIVERSE 510
 #define OUTPUT_BYTES_PER_UNIVERSE 510*4/3
@@ -164,8 +165,8 @@
 
 
 // Precompute some useful constants based on the settings
-const int num_universes = (NUM_PIXELS + 169) / 170;
-const int num_complete_universes = NUM_PIXELS / 170;
+int num_universes;
+int num_complete_universes;
 int last_universe;
 int pixels_in_last_universe;
 
@@ -308,12 +309,17 @@ int process_packet(int packet_length, const uint8_t* buffer) {
 }
 
 
-int receiver() {
+int receiver(long refresh_milliseconds) {
   int s;
 	if ((s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
     perror("socket");
 		return 0;
 	}
+
+	struct timeval tv;
+	tv.tv_sec = refresh_milliseconds / 1000;
+	tv.tv_usec = (refresh_milliseconds % 1000) * 1000;
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(struct timeval));
 
 	struct sockaddr_in si_me;
 	memset((char *) &si_me, 0, sizeof(si_me));
@@ -322,7 +328,6 @@ int receiver() {
 	si_me.sin_addr.s_addr = htonl(INADDR_ANY);
      
 	if (bind(s, (struct sockaddr*)&si_me, sizeof(si_me)) == -1) {
-    perror("bind");
 		return 0;
 	}
 
@@ -330,8 +335,14 @@ int receiver() {
 	uint8_t buffer[1024];
 	ssize_t len;
 	while(1) {
-		if ((len = recv(s, buffer, sizeof(buffer), 0)) == -1) 
-			return 0;
+		if ((len = recv(s, buffer, sizeof(buffer), 0)) == -1) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				do_output();
+			}
+			else {
+				return 0;
+			}
+		}
 		
 			if (!process_packet(len, buffer)) 
 				return 0;
@@ -353,7 +364,7 @@ int init() {
 	// Set up SPI
 	if((fd = open("/dev/spidev0.0", O_RDWR)) < 0) {
 		printf("Can't open /dev/spidev0.0 (try 'sudo')\n");
-		return 0;
+		//return 0; TODO! Re-uncomment
 	}
 	// Mode=0 and no chipselect copied from Adafruit's code
 	uint8_t mode = SPI_MODE_0 | SPI_NO_CS;
@@ -381,7 +392,7 @@ int init() {
 		return 0;
 	}
 	// Initialize to black (leading byte must always be 0xFF, three next
-	// bytes are the colours, set to black.
+	// bytes are the rgb components
 	for (i=0; i<buffer_size; i+=4) {
 		output_buffer[i] = 0xFF;
 		output_buffer[i+1] = 0;
@@ -405,11 +416,34 @@ void cleanup() {
 }
 
 int main(int argc, char** argv) {
+
+	int refresh_interval = 0;
+	if (argc == 3 || argc == 4) {
+		START_UNIVERSE = atoi(argv[1]);
+		NUM_PIXELS = atoi(argv[2]);
+		if (argc == 4) {
+			refresh_interval = atoi(argv[3]);
+		}
+	}
+	else {
+		printf("use: %s FIRST_UNIVERSE NUM_PIXELS [REFRESH_INTERVAL]\n", argv[0]);
+		printf("     FIRST_UNIVERSE:   Hardware-ID (zero based) of first DMX universe\n");
+		printf("     NUM_PIXELS:       Number of pixels to drive. If larger than 170,\n");
+		printf("                       multiple sequentially numbered universes will be\n");
+		printf("                       used.\n");
+		printf("     REFRESH_INTERVAL: If specified, pixels are refreshed with buffered\n");
+		printf("                       values every REFRESH_INTERVAL milliseconds, even\n");
+		printf("                       if no data is received.\n");
+		exit(1);
+	}
 	
 	if (!init()) {
 		return 1;
 	}
-	int ok = receiver(); // will only return on error, just prefer it this way
+	num_universes = (NUM_PIXELS + 169) / 170;
+	num_complete_universes = NUM_PIXELS / 170;
+	
+	int ok = receiver(refresh_interval); // will only return on error, just prefer it this way
 	cleanup();
 	if (ok) return 0;
 	else return 1;
