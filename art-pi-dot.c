@@ -364,7 +364,7 @@ int init() {
 	// Set up SPI
 	if((fd = open("/dev/spidev0.0", O_RDWR)) < 0) {
 		printf("Can't open /dev/spidev0.0 (try 'sudo')\n");
-		//return 0; TODO! Re-uncomment
+		return 0;
 	}
 	// Mode=0 and no chipselect copied from Adafruit's code
 	uint8_t mode = SPI_MODE_0 | SPI_NO_CS;
@@ -437,12 +437,13 @@ int main(int argc, char** argv) {
 		exit(1);
 	}
 	
+	num_universes = (NUM_PIXELS + 169) / 170;
+	num_complete_universes = NUM_PIXELS / 170;
+
 	if (!init()) {
 		return 1;
 	}
-	num_universes = (NUM_PIXELS + 169) / 170;
-	num_complete_universes = NUM_PIXELS / 170;
-	
+
 	int ok = receiver(refresh_interval); // will only return on error, just prefer it this way
 	cleanup();
 	if (ok) return 0;
