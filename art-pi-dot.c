@@ -48,7 +48,9 @@
 // each universe (corresponding to DMX, which also has 512 channels).
 // 32768 universes are supported. We only use 510 channels per universe,
 // as this corresponds to the largest number of complete RGB LEDs 
-// possible (170).
+// possible (170). If the global dimmer is enabled, there is four channels
+// per pixel, the number of pixels per universe is 128, and we use all
+// 512 channels.
 
 
 /*
@@ -154,9 +156,12 @@
 // Settings
 int NUM_PIXELS = 0;
 int START_UNIVERSE = 0;
+int dimmer_mode = 0;
+int output_bytes_per_universe = 0;
+int pixels_per_universe = 0;
+int artnet_used_bytes_per_universe = 0;
 
-#define ARTNET_BYTES_PER_UNIVERSE 510
-#define OUTPUT_BYTES_PER_UNIVERSE 510*4/3
+#define ARTNET_MAX_BYTES_PER_UNIVERSE 512
 
 
 
@@ -272,7 +277,7 @@ int process_packet(int packet_length, const uint8_t* buffer) {
 		return 1;
 	}
 	if (universe == last_universe) {
-		if (length > ARTNET_BYTES_PER_UNIVERSE) {
+		if (length > artnet_used_bytes_per_universe) {
 			DBG("Invalid number of pixels received");
 			printf("Got %d data\n", length);
 			return 1;
@@ -280,7 +285,7 @@ int process_packet(int packet_length, const uint8_t* buffer) {
 		length = pixels_in_last_universe*3;
 	}
 	else {
-		if (length != ARTNET_BYTES_PER_UNIVERSE) {
+		if (length != artnet_used_bytes_per_universe) {
 			DBG("Invalid number of pixels received");
 			return 1;
 		}
@@ -293,14 +298,18 @@ int process_packet(int packet_length, const uint8_t* buffer) {
 	DBG("Received a valid packet!");
 	// Accept it without checking more headers
 	//
-	int output_index = (universe-START_UNIVERSE) * OUTPUT_BYTES_PER_UNIVERSE;
+	int output_index = (universe-START_UNIVERSE) * output_bytes_per_universe;
 	int input_index = 18;
 	int i;
+	int input_step = 3 + dimmer_mode;
 
-	for (i=0; i<length; i+=3, input_index+=3, output_index+=4) {
-		output_buffer[output_index+1] = buffer[input_index+2]; // B <- B
-		output_buffer[output_index+2] = buffer[input_index+1]; // G <- G
-		output_buffer[output_index+3] = buffer[input_index];   // R <- R
+	for (i=0; i<length; i+=3, input_index+=input_step, output_index+=4) {
+		if (dimmer_mode) {
+			output_buffer[output_index] = buffer[input_index] | 0xE0; // Header all 1s, 5 bits of dimmer
+		}
+		output_buffer[output_index+1] = buffer[input_index+2+dimmer_mode]; // B <- B
+		output_buffer[output_index+2] = buffer[input_index+1+dimmer_mode]; // G <- G
+		output_buffer[output_index+3] = buffer[input_index+dimmer_mode];   // R <- R
 	}
 
 	// Send to LED strip now if required
@@ -355,7 +364,7 @@ int init() {
 	int i;
 	
 	last_universe = START_UNIVERSE + num_universes - 1;
-	pixels_in_last_universe = NUM_PIXELS - (num_universes-1) * 170;
+	pixels_in_last_universe = NUM_PIXELS - (num_universes-1) * pixels_per_universe;
 
 	// Initialize buffers and data structures
 	arrival_time = (uint32_t*)malloc(num_universes * sizeof(uint32_t));
@@ -400,14 +409,27 @@ int init() {
 		output_buffer[i+3] = 0;
 	}
 
+	// For the footer we should send one FF byte for every 16 pixels
+	// (rounded up). It's not important what we send, but it's good to not send
+	// zeros, as that might be interpreted as a header.
+	const int footer_size = (NUM_PIXELS + 15) / 16;
+	uint8_t* footer = (uint8_t*)malloc(footer_size);
+	if (footer == NULL) {
+		printf("Unable to allocate footer buffer (not enough memory?)\n");
+		return 0;
+	}
+	for (i=0; i<footer_size; ++i) {
+		footer[i] = 0xFF;
+	}
+
 	// Set up SPI output data structures
 	memset((char*) xfer, 0, sizeof(xfer));
 	xfer[0].tx_buf = 0;
 	xfer[1].tx_buf = (unsigned long)output_buffer;
-	xfer[2].tx_buf = 0;
+	xfer[2].tx_buf = (unsigned long)footer;
 	xfer[0].len = 4;
 	xfer[1].len = buffer_size;
- 	xfer[2].len = (NUM_PIXELS + 15) / 16;
+ 	xfer[2].len = footer_size;
 
 	return 1;
 }
@@ -418,15 +440,25 @@ void cleanup() {
 int main(int argc, char** argv) {
 
 	int refresh_interval = 0;
-	if (argc == 3 || argc == 4) {
-		START_UNIVERSE = atoi(argv[1]);
-		NUM_PIXELS = atoi(argv[2]);
-		if (argc == 4) {
-			refresh_interval = atoi(argv[3]);
+	if (argc == 4 || argc == 5) {
+		dimmer_mode = atoi(argv[1]);
+		START_UNIVERSE = atoi(argv[2]);
+		NUM_PIXELS = atoi(argv[3]);
+		if (argc == 5) {
+			refresh_interval = atoi(argv[4]);
+		}
+		if (dimmer_mode != 0 && dimmer_mode != 1) {
+			printf("ERROR: Dimmer mode should be 0 or 1.");
+			return 1;
 		}
 	}
 	else {
 		printf("use: %s FIRST_UNIVERSE NUM_PIXELS [REFRESH_INTERVAL]\n", argv[0]);
+		printf("     DIMMER_MODE:      Set to 1 if using four channnels per pixel, where\n");
+		printf("                       the first channel is a global (hardware) dimmer. The\n");
+		printf("                       dimmer supports 5 bits dynamic range, and may use slow PWM.\n");
+		printf("                       Set to 0, use 3 channels per pixel and set dimmer to\n");
+		printf("                       full brightness.\n");
 		printf("     FIRST_UNIVERSE:   Hardware-ID (zero based) of first DMX universe\n");
 		printf("     NUM_PIXELS:       Number of pixels to drive. If larger than 170,\n");
 		printf("                       multiple sequentially numbered universes will be\n");
@@ -437,9 +469,16 @@ int main(int argc, char** argv) {
 		exit(1);
 	}
 	
-	num_universes = (NUM_PIXELS + 169) / 170;
-	num_complete_universes = NUM_PIXELS / 170;
+	pixels_per_universe = ARTNET_MAX_BYTES_PER_UNIVERSE / (3 + dimmer_mode);
+	// Round up universe count
+	num_universes = (NUM_PIXELS + pixels_per_universe + 1) / pixels_per_universe;
+	num_complete_universes = NUM_PIXELS / pixels_per_universe;
+	artnet_used_bytes_per_universe = pixels_per_universe * (3 + dimmer_mode);
 
+	// Output always includes the dimmer/header byte regardless of whether they
+	// are used, and includes 3 bytes of colour data.
+	output_bytes_per_universe = pixels_per_universe * 4;
+	
 	if (!init()) {
 		return 1;
 	}
